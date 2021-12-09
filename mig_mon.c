@@ -27,6 +27,13 @@ typedef enum {
     PATTERN_NUM,
 } dirty_pattern;
 
+typedef enum {
+    EMULATE_NONE = 0,
+    EMULATE_SRC = 1,
+    EMULATE_DST = 2,
+    EMULATE_NUM,
+} emulate_target;
+
 #define  VERSION  "v0.2.0"
 
 char *pattern_str[PATTERN_NUM] = { "sequential", "random", "once" };
@@ -92,6 +99,17 @@ void usage_mm_dirty(void)
     puts("");
 }
 
+void usage_vm(void)
+{
+    puts("======== Emulate VM Live Migrations ========");
+    puts("");
+    puts("This tool can be used to emulate live migration TCP streams.");
+    puts("");
+    puts("To start a src VM emulation, use '-s'.");
+    puts("To start a dst VM emulation, use '-d'.");
+    puts("");
+}
+
 void version(void)
 {
     printf("Version: %s\n", VERSION);
@@ -115,6 +133,12 @@ void usage(void)
     printf("       \t -p: \twork pattern: \"sequential\", \"random\", or \"once\"\n");
     printf("       \t\t(default: \"%s\")\n", pattern_str[DEF_MM_DIRTY_PATTERN]);
     printf("       \t -P: \tpage size: \"2m\" or \"1g\" for huge pages\n");
+    puts("");
+    printf("       %s vm [options...]\n", prog_name);
+    printf("       \t -s: \temulate a src VM\n");
+    printf("       \t -S: \tspecify size of the VM (GB)\n");
+    printf("       \t -d: \temulate a dst VM\n");
+    printf("       \t -H: \tspecify dst VM IP (required for -s)\n");
     puts("");
 }
 
@@ -743,6 +767,240 @@ int mon_mm_dirty(long mm_size, long dirty_rate, dirty_pattern pattern,
     return 0;
 }
 
+#define  DEF_VM_SIZE  (1UL << 40)  /* 1TB */
+#define  DEF_MAGIC    0x123
+
+typedef struct {
+    uint64_t vm_size;
+} vm_args;
+
+typedef struct {
+    uint64_t magic;
+    uint64_t page_index;
+} page_header;
+
+static char *page_buffer;
+
+int sock_write(int sock, void *buffer, uint64_t total)
+{
+    int ret, size = total;
+
+    while (size) {
+        ret = write(sock, buffer, size);
+        if (ret < 0) {
+            if (ret == -EAGAIN || ret == -EINTR)
+                continue;
+            return ret;
+        }
+        size -= ret;
+        buffer = (void *)((uint64_t)buffer + ret);
+    }
+
+    return 0;
+}
+
+int sock_read(int sock, void *buffer, uint64_t total)
+{
+    int ret, size = total;
+
+    while (size) {
+        ret = read(sock, buffer, size);
+        if (ret < 0) {
+            if (ret == -EAGAIN || ret == -EINTR)
+                continue;
+            return ret;
+        }
+        size -= ret;
+        buffer = (void *)((uint64_t)buffer + ret);
+    }
+
+    return 0;
+}
+
+void vm_src_run(int sock, const char *dst_ip, vm_args *args)
+{
+    int index = 0, end = args->vm_size / page_size, ret;
+    page_header header = { .magic = DEF_MAGIC };
+    uint64_t total = 0, last, cur;
+
+    printf("Connected to dst VM %s.\n", dst_ip);
+
+    last = get_msec();
+
+    while (1) {
+        for (index = 0; index < end; index++) {
+            header.page_index = index;
+            ret = sock_write(sock, &header, sizeof(header));
+            if (ret) {
+                printf("write() failure: %d\n", ret);
+                goto out;
+            }
+            ret = sock_write(sock, page_buffer, page_size);
+            if (ret) {
+                printf("write() failure: %d\n", ret);
+                goto out;
+            }
+            total += sizeof(header) + page_size;
+            cur = get_msec();
+            if (cur - last >= 1000) {
+                printf("Speed: %"PRIu64" (MB/s)\n", total / (1UL << 20));
+                last = cur;
+                total = 0;
+            }
+        }
+        /* Go around */
+        index = 0;
+    }
+out:
+    close(sock);
+    printf("Dropped connection to dst VM %s.\n", dst_ip);
+}
+
+int mon_start_src(const char *dst_ip, vm_args *args)
+{
+    int sock, ret;
+    struct sockaddr_in server;
+
+    puts("Start emulation of src VM.");
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("Could not create socket.");
+        return -errno;
+    }
+
+    server.sin_family = AF_INET;
+    server.sin_port = htons(MIG_MON_PORT);
+    if (inet_aton(dst_ip, &server.sin_addr) != 1) {
+        printf("Destination VM address '%s' invalid\n", dst_ip);
+        return -1;
+    }
+
+    ret = connect(sock, (struct sockaddr *)&server, sizeof(server));
+    if (ret < 0) {
+        perror("Could not connect to dst VM.");
+        return -1;
+    }
+
+    vm_src_run(sock, dst_ip, args);
+
+    return 0;
+}
+
+void vm_dst_run(int sock, char *src_ip, vm_args *args)
+{
+    int ret;
+    page_header header;
+    uint64_t end = args->vm_size / page_size;
+
+    printf("Connected from src VM %s.\n", src_ip);
+
+    while (1) {
+        ret = sock_read(sock, &header, sizeof(header));
+        if (ret) {
+            printf("read() failed: %d\n", ret);
+            goto out;
+        }
+        if (header.magic != DEF_MAGIC) {
+            printf("magic wrong: 0x%"PRIx64, header.magic);
+            goto out;
+        }
+        if (header.page_index >= end) {
+            printf("page index overflow: 0x%"PRIx64, header.page_index);
+            goto out;
+        }
+        ret = sock_read(sock, page_buffer, page_size);
+        if (ret) {
+            printf("read() failed: %d\n", ret);
+            goto out;
+        }
+    }
+
+out:
+    close(sock);
+    free(src_ip);
+    printf("Dropped connection to src VM %s.\n", src_ip);
+}
+
+int mon_start_dst(vm_args *args)
+{
+    struct sockaddr_in server, cli_addr;
+    int sock, ret, new_sock, child;
+    socklen_t client_len = sizeof(server);
+
+    puts("Start emulation of dst VM.");
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("Could not create socket.");
+        return -errno;
+    }
+
+    memset((char *)&server, 0, sizeof(server));
+
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = INADDR_ANY;
+    server.sin_port = htons(MIG_MON_PORT);
+
+    ret = bind(sock, (struct sockaddr *)&server, sizeof(server));
+    if (ret < 0) {
+        perror("Could not bind.");
+        return -errno;
+    }
+
+    listen(sock, 5);
+
+    while (1) {
+        new_sock = accept(sock, (struct sockaddr *)&cli_addr, &client_len);
+        if (new_sock < 0) {
+            perror("Could not accept client.");
+            return -errno;
+        }
+
+        child = fork();
+        if (child == 0) {
+            vm_dst_run(new_sock, strdup(inet_ntoa(cli_addr.sin_addr)), args);
+            return 0;
+        }
+    }
+
+    return 0;
+}
+
+int mon_vm(emulate_target target, const char *dst_ip, vm_args *args)
+{
+    int ret;
+
+    if (target == EMULATE_NONE) {
+        printf("Please specify to emulate either src (-s) or dst (-d)\n");
+        return -1;
+    }
+
+    if (target == EMULATE_SRC) {
+        if (!dst_ip) {
+            printf("Please specify dst VM address using '-H'.\n");
+            return -1;
+        }
+    }
+
+    page_buffer = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page_buffer == MAP_FAILED) {
+        perror("Page buffer allocation failed");
+        return -errno;
+    }
+
+    if (target == EMULATE_SRC) {
+        ret = mon_start_src(dst_ip, args);
+    } else {
+        ret = mon_start_dst(args);
+    }
+
+    munmap(page_buffer, page_size);
+
+    return ret;
+}
+
 int main(int argc, char *argv[])
 {
     int ret = 0;
@@ -807,6 +1065,34 @@ int main(int argc, char *argv[])
         }
         ret = mon_client(server_ip, interval_ms, spike_log,
                          mon_client_rr_callback);
+    } else if (!strcmp(work_mode, "vm")) {
+        emulate_target target = EMULATE_NONE;
+        const char *dst_ip = "127.0.0.1";
+        vm_args args = { .vm_size = DEF_VM_SIZE };
+        int c;
+
+        while ((c = getopt(argc-1, argv+1, "dhsS:H:")) != -1) {
+            switch (c) {
+            case 'd':
+                target = EMULATE_DST;
+                break;
+            case 's':
+                target = EMULATE_SRC;
+                break;
+            case 'S':
+                args.vm_size = atoi(optarg) * (1UL << 30);
+                break;
+            case 'H':
+                dst_ip = strdup(optarg);
+                break;
+            case 'h':
+            default:
+                usage_vm();
+                return -1;
+            }
+        }
+
+        ret = mon_vm(target, dst_ip, &args);
     } else if (!strcmp(work_mode, "mm_dirty")) {
         long dirty_rate = 0, mm_size = DEF_MM_DIRTY_SIZE;
         dirty_pattern pattern = DEF_MM_DIRTY_PATTERN;
