@@ -20,19 +20,15 @@
 #include <linux/mman.h>
 #endif
 
+#define  MAX(a, b)  ((a > b) ? (a) : (b))
+#define  MIN(a, b)  ((a < b) ? (a) : (b))
+
 typedef enum {
     PATTERN_SEQ = 0,
     PATTERN_RAND = 1,
     PATTERN_ONCE = 2,
     PATTERN_NUM,
 } dirty_pattern;
-
-typedef enum {
-    EMULATE_NONE = 0,
-    EMULATE_SRC = 1,
-    EMULATE_DST = 2,
-    EMULATE_NUM,
-} emulate_target;
 
 #define  VERSION  "v0.2.0"
 
@@ -767,11 +763,45 @@ int mon_mm_dirty(long mm_size, long dirty_rate, dirty_pattern pattern,
     return 0;
 }
 
-#define  DEF_VM_SIZE  (1UL << 40)  /* 1TB */
-#define  DEF_MAGIC    0x123
+#define  DEF_VM_SIZE        (1UL << 40)  /* 1TB */
+#define  DEF_MAGIC          (0x123)
+
+/* These emulates QEMU */
+#define  DEF_IO_BUF_SIZE    32868
+#define  MAX_IOV_SIZE       64
+
+typedef enum {
+    EMULATE_NONE = 0,
+    EMULATE_SRC = 1,
+    EMULATE_DST = 2,
+    EMULATE_NUM,
+} emulate_target;
 
 typedef struct {
+    int sock;
+    emulate_target target;
+    /* Guest memory size (emulated) */
     uint64_t vm_size;
+    union {
+        struct {
+            /* Size = MAX_IOV_SIZE * DEF_IO_BUF_SIZE */
+            struct iovec *src_iov_buffer;
+            /* Dest VM ip */
+            const char *src_target_ip;
+            /* Points to the current IOV being used */
+            int src_cur;
+            /* Length of current IOV that has been consumed */
+            size_t src_cur_len;
+        };
+        struct {
+            /* Size = DEF_IO_BUF_SIZE */
+            char *dst_buffer;
+            /* Length of data consumed */
+            int dst_cur;
+            /* Length of data in dst_buffer */
+            int dst_len;
+        };
+    };
 } vm_args;
 
 typedef struct {
@@ -779,71 +809,154 @@ typedef struct {
     uint64_t page_index;
 } page_header;
 
-static char *page_buffer;
-
-int sock_write(int sock, void *buffer, uint64_t total)
+int sock_write_flush(vm_args *args)
 {
-    int ret, size = total;
+    struct msghdr msg = { NULL, };
+    int ret;
+
+    assert(args->src_cur == 0 && args->src_cur_len == 0);
+
+    msg.msg_iov = args->src_iov_buffer;
+    msg.msg_iovlen = MAX_IOV_SIZE;
+
+retry:
+    ret = sendmsg(args->sock, &msg, 0);
+    if (ret < 0) {
+        if (ret == -EAGAIN || ret == -EINTR)
+            goto retry;
+        printf("sendmsg() failed: %d\n", ret);
+        return ret;
+    }
+
+    /* Closed? */
+    if (ret == 0)
+        return -1;
+
+    return 0;
+}
+
+int sock_write(vm_args *args, void *buffer, uint64_t size)
+{
+    struct iovec *iov = args->src_iov_buffer;
+    int ret;
 
     while (size) {
-        ret = write(sock, buffer, size);
-        if (ret < 0) {
-            if (ret == -EAGAIN || ret == -EINTR)
-                continue;
-            return ret;
+        size_t to_move;
+
+        assert(args->src_cur < MAX_IOV_SIZE);
+        assert(args->src_cur_len < DEF_IO_BUF_SIZE);
+
+        /* Every IOV is the same len */
+        to_move = DEF_IO_BUF_SIZE - args->src_cur_len;
+        to_move = MIN(to_move, size);
+
+        if (buffer) {
+            memcpy(iov[args->src_cur].iov_base + args->src_cur_len,
+                   buffer, to_move);
+            buffer = (void *)((uint64_t)buffer + to_move);
+        } else {
+            bzero(iov[args->src_cur].iov_base + args->src_cur_len, to_move);
         }
+
+        args->src_cur_len += to_move;
         size -= ret;
-        buffer = (void *)((uint64_t)buffer + ret);
+
+        if (args->src_cur_len >= DEF_IO_BUF_SIZE) {
+            assert(args->src_cur_len == DEF_IO_BUF_SIZE);
+            args->src_cur++;
+            args->src_cur_len = 0;
+
+            if (args->src_cur >= MAX_IOV_SIZE) {
+                assert(args->src_cur == MAX_IOV_SIZE);
+                args->src_cur = 0;
+
+                /* Flush all the data in the iovec */
+                ret = sock_write_flush(args);
+                if (ret)
+                    return ret;
+            }
+        }
     }
 
     return 0;
 }
 
-int sock_read(int sock, void *buffer, uint64_t total)
+int sock_read_refill(vm_args *args)
 {
-    int ret, size = total;
+    int ret;
+
+    /* Make sure we've consumed all */
+    assert(args->dst_cur == args->dst_len);
+retry:
+    ret = read(args->sock, args->dst_buffer, DEF_IO_BUF_SIZE);
+    if (ret < 0) {
+        if (ret == -EAGAIN || ret == -EINTR)
+            goto retry;
+        perror("read() failed");
+        return ret;
+    }
+    /* Closed? */
+    if (ret == 0)
+        return -1;
+
+    args->dst_len = ret;
+    args->dst_cur = 0;
+
+    return 0;
+}
+
+int sock_read(vm_args *args, void *buf, uint64_t size)
+{
+    int len;
 
     while (size) {
-        ret = read(sock, buffer, size);
-        if (ret < 0) {
-            if (ret == -EAGAIN || ret == -EINTR)
-                continue;
-            return ret;
+        /* Out of data in the buffer, refill */
+        if (args->dst_cur >= args->dst_len) {
+            assert(args->dst_cur == args->dst_len);
+            len = sock_read_refill(args);
+            if (len < 0)
+                return len;
         }
-        size -= ret;
-        buffer = (void *)((uint64_t)buffer + ret);
+
+        len = args->dst_len - args->dst_cur;
+        len = MIN(len, size);
+
+        if (buf) {
+            memcpy(buf, &args->dst_buffer[args->dst_cur], len);
+            buf += len;
+        }
+
+        args->dst_cur += len;
+        size -= len;
     }
 
     return 0;
 }
 
-void vm_src_run(int sock, const char *dst_ip, vm_args *args)
+void vm_src_run(vm_args *args)
 {
-    int index = 0, end = args->vm_size / page_size, ret;
+    int index = 0, end = args->vm_size / page_size;
     page_header header = { .magic = DEF_MAGIC };
     uint64_t total = 0, last, cur;
+    int ret;
 
-    printf("Connected to dst VM %s.\n", dst_ip);
+    printf("Connected to dst VM %s.\n", args->src_target_ip);
 
     last = get_msec();
-
     while (1) {
         for (index = 0; index < end; index++) {
             header.page_index = index;
-            ret = sock_write(sock, &header, sizeof(header));
-            if (ret) {
-                printf("write() failure: %d\n", ret);
+            ret = sock_write(args, &header, sizeof(header));
+            if (ret)
                 goto out;
-            }
-            ret = sock_write(sock, page_buffer, page_size);
-            if (ret) {
-                printf("write() failure: %d\n", ret);
+            ret = sock_write(args, NULL, page_size);
+            if (ret)
                 goto out;
-            }
             total += sizeof(header) + page_size;
             cur = get_msec();
             if (cur - last >= 1000) {
-                printf("Speed: %"PRIu64" (MB/s)\n", total / (1UL << 20));
+                printf("Speed: %"PRIu64" (MB/s)\n",
+                       (total / (1UL << 20)) * 1000 / (cur - last));
                 last = cur;
                 total = 0;
             }
@@ -852,11 +965,11 @@ void vm_src_run(int sock, const char *dst_ip, vm_args *args)
         index = 0;
     }
 out:
-    close(sock);
-    printf("Dropped connection to dst VM %s.\n", dst_ip);
+    close(args->sock);
+    printf("Dropped connection to dst VM %s.\n", args->src_target_ip);
 }
 
-int mon_start_src(const char *dst_ip, vm_args *args)
+int mon_start_src(vm_args *args)
 {
     int sock, ret;
     struct sockaddr_in server;
@@ -871,8 +984,8 @@ int mon_start_src(const char *dst_ip, vm_args *args)
 
     server.sin_family = AF_INET;
     server.sin_port = htons(MIG_MON_PORT);
-    if (inet_aton(dst_ip, &server.sin_addr) != 1) {
-        printf("Destination VM address '%s' invalid\n", dst_ip);
+    if (inet_aton(args->src_target_ip, &server.sin_addr) != 1) {
+        printf("Destination VM address '%s' invalid\n", args->src_target_ip);
         return -1;
     }
 
@@ -882,43 +995,39 @@ int mon_start_src(const char *dst_ip, vm_args *args)
         return -1;
     }
 
-    vm_src_run(sock, dst_ip, args);
+    args->sock = sock;
+    vm_src_run(args);
 
     return 0;
 }
 
-void vm_dst_run(int sock, char *src_ip, vm_args *args)
+void vm_dst_run(vm_args *args, char *src_ip)
 {
-    int ret;
-    page_header header;
     uint64_t end = args->vm_size / page_size;
+    page_header header;
+    int ret;
 
     printf("Connected from src VM %s.\n", src_ip);
 
     while (1) {
-        ret = sock_read(sock, &header, sizeof(header));
-        if (ret) {
-            printf("read() failed: %d\n", ret);
+        ret = sock_read(args, &header, sizeof(header));
+        if (ret)
             goto out;
-        }
         if (header.magic != DEF_MAGIC) {
-            printf("magic wrong: 0x%"PRIx64, header.magic);
+            printf("magic error: 0x%"PRIx64"\n", header.magic);
             goto out;
         }
         if (header.page_index >= end) {
-            printf("page index overflow: 0x%"PRIx64, header.page_index);
+            printf("page index overflow: 0x%"PRIx64"\n", header.page_index);
             goto out;
         }
-        ret = sock_read(sock, page_buffer, page_size);
-        if (ret) {
-            printf("read() failed: %d\n", ret);
+        ret = sock_read(args, NULL, page_size);
+        if (ret)
             goto out;
-        }
     }
 
 out:
-    close(sock);
-    free(src_ip);
+    close(args->sock);
     printf("Dropped connection to src VM %s.\n", src_ip);
 }
 
@@ -959,7 +1068,8 @@ int mon_start_dst(vm_args *args)
 
         child = fork();
         if (child == 0) {
-            vm_dst_run(new_sock, strdup(inet_ntoa(cli_addr.sin_addr)), args);
+            args->sock = new_sock;
+            vm_dst_run(args, strdup(inet_ntoa(cli_addr.sin_addr)));
             return 0;
         }
     }
@@ -967,9 +1077,16 @@ int mon_start_dst(vm_args *args)
     return 0;
 }
 
-int mon_vm(emulate_target target, const char *dst_ip, vm_args *args)
+void *mmap_anon(size_t size)
+{
+    return mmap(NULL, size, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+}
+
+int mon_vm(vm_args *args)
 {
     int ret;
+    emulate_target target = args->target;
 
     if (target == EMULATE_NONE) {
         printf("Please specify to emulate either src (-s) or dst (-d)\n");
@@ -977,26 +1094,49 @@ int mon_vm(emulate_target target, const char *dst_ip, vm_args *args)
     }
 
     if (target == EMULATE_SRC) {
-        if (!dst_ip) {
+        if (!args->src_target_ip) {
             printf("Please specify dst VM address using '-H'.\n");
             return -1;
         }
     }
 
-    page_buffer = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (page_buffer == MAP_FAILED) {
-        perror("Page buffer allocation failed");
-        return -errno;
-    }
-
     if (target == EMULATE_SRC) {
-        ret = mon_start_src(dst_ip, args);
+        struct iovec *buf;
+        int i;
+
+        buf = mmap_anon(sizeof(struct iovec) * MAX_IOV_SIZE);
+        if (buf == MAP_FAILED) {
+            perror("IOV buffer allocation failed");
+            return -errno;
+        }
+
+        for (i = 0; i < MAX_IOV_SIZE; i++) {
+            buf[i].iov_len = DEF_IO_BUF_SIZE;
+            buf[i].iov_base = mmap_anon(DEF_IO_BUF_SIZE);
+            if (buf[i].iov_base == MAP_FAILED) {
+                perror("IOV buffer allocation failed");
+                return -errno;
+            }
+        }
+
+        args->src_iov_buffer = buf;
+        args->src_cur = 0;
+        args->src_cur_len = 0;
+        ret = mon_start_src(args);
     } else {
+        char *buf;
+
+        buf = mmap_anon(DEF_IO_BUF_SIZE);
+        if (buf == MAP_FAILED) {
+            perror("Recv buffer map failed");
+            return -1;
+        }
+
+        args->dst_buffer = buf;
+        args->dst_cur = 0;
+        args->dst_len = 0;
         ret = mon_start_dst(args);
     }
-
-    munmap(page_buffer, page_size);
 
     return ret;
 }
@@ -1066,24 +1206,25 @@ int main(int argc, char *argv[])
         ret = mon_client(server_ip, interval_ms, spike_log,
                          mon_client_rr_callback);
     } else if (!strcmp(work_mode, "vm")) {
-        emulate_target target = EMULATE_NONE;
-        const char *dst_ip = "127.0.0.1";
-        vm_args args = { .vm_size = DEF_VM_SIZE };
+        vm_args args = {
+            .target = EMULATE_NONE,
+            .vm_size = DEF_VM_SIZE,
+        };
         int c;
 
         while ((c = getopt(argc-1, argv+1, "dhsS:H:")) != -1) {
             switch (c) {
             case 'd':
-                target = EMULATE_DST;
+                args.target = EMULATE_DST;
                 break;
             case 's':
-                target = EMULATE_SRC;
+                args.target = EMULATE_SRC;
                 break;
             case 'S':
                 args.vm_size = atoi(optarg) * (1UL << 30);
                 break;
             case 'H':
-                dst_ip = strdup(optarg);
+                args.src_target_ip = strdup(optarg);
                 break;
             case 'h':
             default:
@@ -1092,7 +1233,7 @@ int main(int argc, char *argv[])
             }
         }
 
-        ret = mon_vm(target, dst_ip, &args);
+        ret = mon_vm(&args);
     } else if (!strcmp(work_mode, "mm_dirty")) {
         long dirty_rate = 0, mm_size = DEF_MM_DIRTY_SIZE;
         dirty_pattern pattern = DEF_MM_DIRTY_PATTERN;
